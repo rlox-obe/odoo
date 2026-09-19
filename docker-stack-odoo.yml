@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  postgresql:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: odoo
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-odoo_secure_pass}
+    volumes:
+      - odoo_postgres:/var/lib/postgresql/data
+    networks:
+      - odoo_network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  odoo:
+    image: odoo:latest
+    ports:
+      - "8069:8069"
+      - "8072:8072"
+    environment:
+      HOST: postgresql
+      USER: odoo
+      PASSWORD: ${DB_PASSWORD:-odoo_secure_pass}
+      DB_PORT: 5432
+      WORKERS: 4
+    volumes:
+      - odoo_data:/var/lib/odoo
+      - odoo_addons:/mnt/extra-addons
+    networks:
+      - odoo_network
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+
+networks:
+  odoo_network:
+    driver: overlay
+
+volumes:
+  odoo_data:
+    driver: local
+  odoo_addons:
+    driver: local
+  odoo_postgres:
+    driver: local

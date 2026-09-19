@@ -1,0 +1,33 @@
+name: Deploy Odoo Stack
+
+on:
+  push:
+    branches: [ main, develop, '19.0' ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Decode SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+      
+      - name: Add SSH Host Key
+        run: |
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      
+      - name: Copy docker-stack to Server
+        run: |
+          scp -P ${{ secrets.SSH_PORT }} -r docker-stack-odoo.yml ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/docker-stack-odoo.yml
+      
+      - name: Deploy Stack on Docker Swarm
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'DEPLOY'
+          docker stack deploy -c /tmp/docker-stack-odoo.yml odoo-prod
+          docker service ls | grep odoo
+          echo "✓ Odoo Stack deployed successfully"
+          DEPLOY
