@@ -63,6 +63,11 @@ services:
       PORT: 5432
       USER: odoo
       PASSWORD_FILE: /run/secrets/odoo_db_password
+      # Third-party addons may need python packages the stock image lacks
+      # (mcp_server needs authlib and packaging). They are pip-installed into
+      # the shared tree rather than baked into an image, so every node sees
+      # the same set and a restart does not lose them.
+      PYTHONPATH: /mnt/pylibs
     secrets:
       - odoo_db_password
     volumes:
@@ -72,6 +77,10 @@ services:
       - type: bind
         source: /home/ralph/docker-volumes/odoo/addons
         target: /mnt/extra-addons
+      - type: bind
+        source: /home/ralph/docker-volumes/odoo/pylibs
+        target: /mnt/pylibs
+        read_only: true
     networks:
       - odoo_network
     # Unconstrained on purpose: filestore and sessions are on the shared tree,

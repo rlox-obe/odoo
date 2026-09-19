@@ -35,13 +35,13 @@ jobs:
           ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
             "VOLUME_ROOT='${{ env.VOLUME_ROOT }}' bash -s" <<'PREP'
           set -euo pipefail
-          mkdir -p "$VOLUME_ROOT"/{data,addons,postgres}
+          mkdir -p "$VOLUME_ROOT"/{data,addons,postgres,pylibs}
           # The odoo image runs as uid 100/gid 101 with USER odoo set, so it
           # cannot chown its own mounts -- seed the ownership from a root
           # container (works on the local ext4 and over NFS thanks to
           # no_root_squash in /etc/exports). postgres (uid 70) chowns itself.
           docker run --rm -v "$VOLUME_ROOT":/dst alpine sh -c '
-            chown 100:101 /dst/data /dst/addons
+            chown 100:101 /dst/data /dst/addons /dst/pylibs
             chown 70:70  /dst/postgres
           '
           ls -la "$VOLUME_ROOT"
