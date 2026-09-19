@@ -1,4 +1,16 @@
-version: '3.8'
+# Deployed via .github/workflows/deploy.yml -> docker stack deploy -c … odoo-prod
+#
+# Prerequisite (once per swarm):
+#   printf '%s' '<password>' | docker secret create odoo_db_password -
+#
+# STORAGE
+# All state lives under /home/ralph/docker-volumes/odoo, which v10033.1blu.de
+# exports over NFSv4 to the other swarm nodes (see /etc/exports). Every node
+# therefore sees the same tree, so tasks can be rescheduled freely.
+#
+# Ownership matters: the odoo image runs as uid 100/gid 101 and declares
+# USER odoo, so it cannot chown its own mounts -- the deploy workflow pre-seeds
+# the directories. postgres (uid 70) starts as root and chowns its own.
 
 services:
   postgresql:
@@ -6,16 +18,27 @@ services:
     environment:
       POSTGRES_DB: odoo
       POSTGRES_USER: odoo
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-odoo_secure_pass}
+      POSTGRES_PASSWORD_FILE: /run/secrets/odoo_db_password
+    secrets:
+      - odoo_db_password
     volumes:
-      - odoo_postgres:/var/lib/postgresql/data
+      - type: bind
+        source: /home/ralph/docker-volumes/odoo/postgres
+        target: /var/lib/postgresql/data
     networks:
       - odoo_network
     deploy:
       replicas: 1
       placement:
+        # Pinned to the node that OWNS the share, where this path is local ext4
+        # rather than an NFS client mount -- a Postgres data directory over NFS
+        # invites locking and fsync trouble. This costs no availability: if
+        # v10033 is down the share is gone for every node anyway.
         constraints:
-          - node.role == manager
+          - node.hostname == v10033.1blu.de
+      restart_policy:
+        condition: on-failure
+        delay: 10s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 10s
@@ -23,29 +46,40 @@ services:
       retries: 5
 
   odoo:
-    image: odoo:latest
+    image: odoo:19
+    # The official entrypoint only maps HOST/PORT/USER/PASSWORD to CLI flags --
+    # WORKERS is not read. Multiprocessing must be set on the command line, and
+    # it is what makes the gevent port (8072) listen at all.
+    command: >
+      odoo
+      --workers 4
+      --max-cron-threads 2
+      --proxy-mode
     ports:
       - "8069:8069"
       - "8072:8072"
     environment:
       HOST: postgresql
+      PORT: 5432
       USER: odoo
-      PASSWORD: ${DB_PASSWORD:-odoo_secure_pass}
-      DB_PORT: 5432
-      WORKERS: 4
+      PASSWORD_FILE: /run/secrets/odoo_db_password
+    secrets:
+      - odoo_db_password
     volumes:
-      - odoo_data:/var/lib/odoo
-      - odoo_addons:/mnt/extra-addons
+      - type: bind
+        source: /home/ralph/docker-volumes/odoo/data
+        target: /var/lib/odoo
+      - type: bind
+        source: /home/ralph/docker-volumes/odoo/addons
+        target: /mnt/extra-addons
     networks:
       - odoo_network
-    depends_on:
-      postgresql:
-        condition: service_healthy
+    # Unconstrained on purpose: filestore and sessions are on the shared tree,
+    # so this may run on any node and still serve the same state.
+    # NOTE: swarm ignores depends_on, so odoo may start before postgres is
+    # ready. The entrypoint's wait-for-psql (30s) plus restart_policy cover it.
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
       restart_policy:
         condition: on-failure
         delay: 10s
@@ -55,10 +89,6 @@ networks:
   odoo_network:
     driver: overlay
 
-volumes:
-  odoo_data:
-    driver: local
-  odoo_addons:
-    driver: local
-  odoo_postgres:
-    driver: local
+secrets:
+  odoo_db_password:
+    external: true

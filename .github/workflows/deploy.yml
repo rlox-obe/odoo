@@ -4,30 +4,82 @@ on:
   push:
     branches: [ main, develop, '19.0' ]
 
+env:
+  # NFS share exported by v10033.1blu.de to the other swarm nodes.
+  # All Odoo state lives here so tasks can be rescheduled across hosts.
+  VOLUME_ROOT: /home/ralph/docker-volumes/odoo
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
+      - uses: actions/checkout@v4
+
       - name: Decode SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-      
+
       - name: Add SSH Host Key
         run: |
           ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
-      
+
       - name: Copy docker-stack to Server
         run: |
-          scp -P ${{ secrets.SSH_PORT }} -r docker-stack-odoo.yml ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/docker-stack-odoo.yml
-      
+          scp -P ${{ secrets.SSH_PORT }} docker-stack-odoo.yml \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/docker-stack-odoo.yml
+
+      - name: Prepare NFS volume directories
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "VOLUME_ROOT='${{ env.VOLUME_ROOT }}' bash -s" <<'PREP'
+          set -euo pipefail
+          mkdir -p "$VOLUME_ROOT"/{data,addons,postgres}
+          # The odoo image runs as uid 100/gid 101 with USER odoo set, so it
+          # cannot chown its own mounts -- seed the ownership from a root
+          # container (works on the local ext4 and over NFS thanks to
+          # no_root_squash in /etc/exports). postgres (uid 70) chowns itself.
+          docker run --rm -v "$VOLUME_ROOT":/dst alpine sh -c '
+            chown 100:101 /dst/data /dst/addons
+            chown 70:70  /dst/postgres
+          '
+          ls -la "$VOLUME_ROOT"
+          PREP
+
+      - name: Verify DB password secret exists
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash -s <<'CHECK'
+          set -euo pipefail
+          if ! docker secret ls --format '{{.Name}}' | grep -qx odoo_db_password; then
+            echo "::error::Swarm secret 'odoo_db_password' is missing. Create it once with:"
+            echo "::error::  printf '%s' '<password>' | docker secret create odoo_db_password -"
+            exit 1
+          fi
+          CHECK
+
       - name: Deploy Stack on Docker Swarm
         run: |
-          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'DEPLOY'
-          docker stack deploy -c /tmp/docker-stack-odoo.yml odoo-prod
-          docker service ls | grep odoo
-          echo "✓ Odoo Stack deployed successfully"
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash -s <<'DEPLOY'
+          set -euo pipefail
+          docker stack deploy --detach=false -c /tmp/docker-stack-odoo.yml odoo-prod
+          docker stack services odoo-prod
           DEPLOY
+
+      - name: Smoke test
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash -s <<'SMOKE'
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://localhost:8069/web/login || true)
+            if [ "$code" = "200" ]; then
+              echo "Odoo is serving (HTTP $code)"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $code -- waiting"
+            sleep 10
+          done
+          echo "::error::Odoo did not return HTTP 200 within 5 minutes"
+          docker service logs --tail 50 odoo-prod_odoo
+          exit 1
+          SMOKE
